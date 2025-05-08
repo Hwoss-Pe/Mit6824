@@ -28,7 +28,7 @@ type Task struct {
 type TaskType int
 
 const (
-	UnKnown TaskType = iota
+	UnKnown TaskType = iota //表示切换状态的时候，从map切换reduce还有在跑的
 	MapTask
 	ReduceTask
 )
