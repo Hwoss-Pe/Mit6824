@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -35,6 +36,23 @@ const (
 	ReducePhase
 	AllDone //任务分配完成
 )
+
+// 用于持久化的状态结构体
+type CoordinatorState struct {
+	TaskId     int               // 当前任务ID
+	DistPhase  Phase             // 分布式处理阶段
+	TaskStates map[int]TaskState // 任务状态映射
+	Done       bool              // 是否完成
+}
+
+// 持久化的任务状态
+type TaskState struct {
+	Type        TaskType   // 任务类型
+	State       TaskStatus // 任务状态
+	FileName    string     // 任务对应的文件名
+	MapIndex    int        // Map任务索引
+	ReduceIndex int        // Reduce任务索引
+}
 
 func (c *Coordinator) ReportTaskCompleted(req *ReportTaskReq, resp *ReportTaskResp) error {
 	c.lock.Lock()
@@ -278,28 +296,40 @@ func (c *Coordinator) Done() bool {
 
 // MakeCoordinator 文件多少其实也决定了多少个map
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-
+	// 创建基础的Coordinator结构
 	c := Coordinator{
 		files:          files,
 		ReduceNum:      nReduce,
-		DistPhase:      MapPhase,
 		MapChan:        make(chan *Task, len(files)),
 		ReduceChan:     make(chan *Task, nReduce),
 		lock:           sync.RWMutex{},
-		TaskMetaHolder: make(map[int]*TaskMetaInfo, len(files)+nReduce), // 任务的总数应该是files + Reducer的数量
-		mapIndexes:     make(map[int]int, len(files)),                   // TaskId -> MapIndex
-		reduceIndexes:  make(map[int]int, nReduce),                      // TaskId -> ReduceIndex
-		done:           false,                                           // 初始时未完成
+		TaskMetaHolder: make(map[int]*TaskMetaInfo),
+		mapIndexes:     make(map[int]int),
+		reduceIndexes:  make(map[int]int),
+		done:           false,
 	}
 
-	LogInfo("初始化Coordinator: %d个输入文件, %d个Reduce任务", len(files), nReduce)
+	// 尝试从持久化状态恢复
+	stateLoaded := c.loadState()
 
-	//初始化map任务
-	c.makeMapTasks(files)
+	if !stateLoaded {
+		// 如果没有找到状态文件或加载失败，初始化新的MapReduce作业
+		LogInfo("初始化新的Coordinator: %d个输入文件, %d个Reduce任务", len(files), nReduce)
+		c.DistPhase = MapPhase
+
+		//初始化map任务
+		c.makeMapTasks(files)
+	} else {
+		LogInfo("从持久化状态恢复Coordinator成功")
+	}
 
 	// 启动超时检查机制
 	c.startTimeoutChecker()
 
+	// 启动状态持久化机制
+	c.startPersistenceRoutine()
+
+	// 启动RPC服务器
 	c.server()
 	return &c
 }
@@ -462,5 +492,136 @@ func (c *Coordinator) startTimeoutChecker() {
 			c.checkTaskTimeout()
 			time.Sleep(3 * time.Second) // 每3秒检查一次
 		}
+	}()
+}
+
+// 定期保存状态的函数
+func (c *Coordinator) persistState() {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	state := CoordinatorState{
+		TaskId:     c.TaskId,
+		DistPhase:  c.DistPhase,
+		TaskStates: make(map[int]TaskState),
+		Done:       c.done,
+	}
+
+	// 保存任务状态
+	for id, info := range c.TaskMetaHolder {
+		state.TaskStates[id] = TaskState{
+			Type:        info.TaskAdr.TaskType,
+			State:       info.state,
+			FileName:    info.TaskAdr.FileName,
+			MapIndex:    info.TaskAdr.MapIndex,
+			ReduceIndex: info.TaskAdr.ReduceIndex,
+		}
+	}
+
+	// 序列化到文件
+	data, err := json.Marshal(state)
+	if err != nil {
+		LogError("序列化状态失败: %v", err)
+		return
+	}
+
+	// 使用临时文件+重命名确保原子性写入
+	tmpFile, err := os.CreateTemp(".", "mr-state-tmp-*")
+	if err != nil {
+		LogError("创建临时状态文件失败: %v", err)
+		return
+	}
+
+	_, err = tmpFile.Write(data)
+	if err != nil {
+		LogError("写入状态失败: %v", err)
+		tmpFile.Close()
+		return
+	}
+
+	tmpFile.Close()
+	err = os.Rename(tmpFile.Name(), "mr-coordinator-state.json")
+	if err != nil {
+		LogError("重命名状态文件失败: %v", err)
+	}
+}
+
+// 从持久化状态恢复
+func (c *Coordinator) loadState() bool {
+	data, err := os.ReadFile("mr-coordinator-state.json")
+	if err != nil {
+		LogInfo("没有找到状态文件或读取失败: %v", err)
+		return false
+	}
+
+	var state CoordinatorState
+	err = json.Unmarshal(data, &state)
+	if err != nil {
+		LogError("解析状态文件失败: %v", err)
+		return false
+	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// 恢复基本状态
+	c.TaskId = state.TaskId
+	c.DistPhase = state.DistPhase
+	c.done = state.Done
+
+	// 恢复任务状态
+	for id, taskState := range state.TaskStates {
+		task := &Task{
+			TaskId:      id,
+			TaskType:    taskState.Type,
+			Status:      Waiting, // 重启后所有任务重新设为等待状态
+			ReduceNum:   c.ReduceNum,
+			FileName:    taskState.FileName,
+			MapIndex:    taskState.MapIndex,
+			ReduceIndex: taskState.ReduceIndex,
+		}
+
+		// 将任务加入对应队列
+		if taskState.State != Done {
+			if task.TaskType == MapTask {
+				c.MapChan <- task
+			} else if task.TaskType == ReduceTask {
+				c.ReduceChan <- task
+			}
+		}
+
+		// 记录任务元数据
+		var state TaskStatus
+		if taskState.State == Done {
+			state = Done
+		} else {
+			state = Waiting
+		}
+		c.TaskMetaHolder[id] = &TaskMetaInfo{
+			state:   state,
+			TaskAdr: task,
+		}
+
+		// 更新索引映射
+		if task.TaskType == MapTask {
+			c.mapIndexes[id] = task.MapIndex
+		} else if task.TaskType == ReduceTask {
+			c.reduceIndexes[id] = task.ReduceIndex
+		}
+	}
+
+	LogInfo("成功从状态文件恢复: 当前阶段=%v, 任务总数=%d", c.DistPhase, len(c.TaskMetaHolder))
+	return true
+}
+
+// 启动状态持久化后台协程
+func (c *Coordinator) startPersistenceRoutine() {
+	go func() {
+		for !c.done {
+			c.persistState()
+			time.Sleep(5 * time.Second) // 每5秒保存一次状态
+		}
+		// 最后一次保存状态
+		c.persistState()
 	}()
 }
