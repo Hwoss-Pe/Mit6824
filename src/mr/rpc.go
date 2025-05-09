@@ -55,14 +55,6 @@ const ( //这个是对某个任务的记录过程
 	Done                      //此阶段已经做完
 )
 
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since

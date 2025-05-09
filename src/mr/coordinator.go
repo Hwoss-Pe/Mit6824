@@ -97,8 +97,7 @@ func (c *Coordinator) ReportTaskCompleted(req *ReportTaskReq, resp *ReportTaskRe
 func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-
-	// 统计任务状态
+	//  统计任务状态
 	mapCount := 0
 	mapDone := 0
 	reduceCount := 0
@@ -133,7 +132,6 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			// 设置任务开始时间
 			startTime := time.Now()
 			task.StartTime = startTime
-
 			// 记录任务信息
 			c.TaskMetaHolder[task.TaskId] = &TaskMetaInfo{
 				state:     Working,
@@ -150,7 +148,6 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			}
 			return nil
 		}
-
 	case ReducePhase:
 		// 优先从ReduceChan获取任务
 		if len(c.ReduceChan) > 0 {
@@ -170,7 +167,6 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			LogDebug("分配Reduce任务: ID=%d, ReduceIndex=%d", task.TaskId, task.ReduceIndex)
 			return nil
 		}
-
 		// 备用方案：直接从TaskMetaHolder查找未分配的Reduce任务
 		for id, info := range c.TaskMetaHolder {
 			if info.TaskAdr.TaskType == ReduceTask && info.state == Waiting {
@@ -184,7 +180,6 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 				return nil
 			}
 		}
-
 		// 检查是否所有Reduce任务都已完成
 		allDone := true
 		for _, info := range c.TaskMetaHolder {
@@ -193,7 +188,6 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 				break
 			}
 		}
-
 		if allDone && reduceCount > 0 {
 			// 所有Reduce任务都完成了
 			LogInfo("所有Reduce任务已完成，切换到AllDone阶段")
@@ -212,14 +206,12 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			}
 			return nil
 		}
-
 	case AllDone:
 		// 所有任务都已完成，返回退出任务
 		reply.Task = Task{
 			TaskType: ExitTask,
 		}
 		return nil
-
 	default:
 		reply.Task = Task{
 			TaskType: WaitingTask,
@@ -334,63 +326,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	return &c
 }
 
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
-}
-
-func (c *Coordinator) CheckPhaseFinish() bool {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-
-	//检查是否所有阶段任务结束，那就是对记录表进行遍历，然后获取需要的任务类型判断其状态
-	switch c.DistPhase {
-	case MapPhase:
-		{
-			// 确保所有Map任务都已完成
-			unfinishedCount := 0
-			mapTaskCount := 0
-			for _, info := range c.TaskMetaHolder {
-				if info.TaskAdr.TaskType == MapTask {
-					mapTaskCount++
-					if info.state != Done {
-						unfinishedCount++
-					}
-				}
-			}
-
-			// 如果没有Map任务，直接返回true（特殊情况）
-			if mapTaskCount == 0 {
-				return true
-			}
-
-			if unfinishedCount > 0 {
-				return false
-			}
-
-			return len(c.MapChan) == 0
-		}
-	case ReducePhase:
-		{
-			// 确保所有Reduce任务都已完成
-			unfinishedCount := 0
-			for _, info := range c.TaskMetaHolder {
-				if info.TaskAdr.TaskType == ReduceTask && info.state != Done {
-					unfinishedCount++
-				}
-			}
-
-			if unfinishedCount > 0 {
-				return false
-			}
-
-			return len(c.ReduceChan) == 0
-		}
-	default:
-		return true
-	}
-}
-
 // makeMapTasks  初始化map任务，文件路径参数
 func (c *Coordinator) makeMapTasks(files []string) {
 	LogInfo("初始化 %d 个Map任务", len(files))
@@ -419,7 +354,6 @@ func (c *Coordinator) makeReduceTasks(nReduce int) {
 		}
 	}()
 
-	// 极简版本 - 不使用generateId，直接使用索引作为ID
 	for i := 0; i < nReduce; i++ {
 		taskId := len(c.files) + i // 使用固定偏移避免与Map任务ID冲突
 
