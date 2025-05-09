@@ -6,8 +6,11 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+	"time"
+)
 
 // worker发送请求给master要一个任务
 
@@ -18,24 +21,35 @@ type GetTaskResp struct {
 	Task Task
 }
 type Task struct {
-	TaskId    int
-	TaskType  TaskType   // 0,1,2 分别对应未知，map，reduce
-	Status    TaskStatus // start process finish 三个状态
-	ReduceNum int
-	fileName  []string //这玩意来固定我的map任务大小
+	TaskId      int
+	TaskType    TaskType   // 0,1,2 分别对应未知，map，reduce
+	Status      TaskStatus // start process finish 三个状态
+	ReduceNum   int
+	FileName    string    //这玩意来固定我的map任务大小
+	MapIndex    int       // 存储映射索引
+	ReduceIndex int       // 存储映射索引
+	StartTime   time.Time // 任务开始执行的时间
 }
 
+type ReportTaskReq struct {
+	TaskId   int
+	TaskType TaskType
+}
+
+type ReportTaskResp struct {
+}
 type TaskType int
 
-const (
-	UnKnown TaskType = iota //表示切换状态的时候，从map切换reduce还有在跑的
+const ( // 这个是记录某个任务的本身
+	WaitingTask TaskType = iota //表示切换状态的时候，从map切换reduce还有在跑的
 	MapTask
 	ReduceTask
+	ExitTask //所有任务完成了
 )
 
 type TaskStatus int
 
-const (
+const ( //这个是对某个任务的记录过程
 	Working TaskStatus = iota //此阶段在工作
 	Waiting                   //此阶段任务等待执行
 	Done                      //此阶段已经做完

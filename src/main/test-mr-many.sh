@@ -12,12 +12,26 @@ trap 'kill -INT -$pid; exit 1' INT
 runs=$1
 chmod +x test-mr.sh
 
+# 检查是否有timeout命令
+if command -v timeout &> /dev/null; then
+    HAS_TIMEOUT=true
+else
+    HAS_TIMEOUT=false
+    echo "Warning: 'timeout' command not found, running without timeouts"
+fi
+
 for i in $(seq 1 $runs); do
-    timeout -k 2s 900s ./test-mr.sh &
+    echo "*** Starting test trial $i of $runs"
+    if [ "$HAS_TIMEOUT" = true ]; then
+        timeout -k 2s 900s ./test-mr.sh &
+    else
+        ./test-mr.sh &
+    fi
     pid=$!
     if ! wait $pid; then
         echo '***' FAILED TESTS IN TRIAL $i
         exit 1
     fi
+    echo "*** Completed test trial $i successfully"
 done
 echo '***' PASSED ALL $i TESTING TRIALS

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# 设置环境变量，禁用日志输出
+export MR_LOG_LEVEL=0
+
 #
 # map-reduce tests
 #
