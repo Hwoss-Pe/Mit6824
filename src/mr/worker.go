@@ -1,17 +1,74 @@
 package mr
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/rpc"
 	"os"
+	"os/signal"
 	"sort"
+	"strings"
+	"syscall"
 	"time"
 )
+
+// 全局变量存储当前处理的记录信息
+var (
+	currentTaskId   int
+	currentTaskType TaskType
+	currentFileName string // 当前处理的文件名
+	currentLineNum  int    // 当前处理的行号
+)
+
+// setupSignalHandler 信号处理器
+func setupSignalHandler() {
+	c := make(chan os.Signal, 1)
+	//指定的系统调用的信号比如段错误和无效内存地址都转发到对应的通道里面
+	//这实际上就是越界和控制针模拟程序出问题了，对于不能解析数据导致json错误的，思路是在解析的时候err打印日志就行了。
+	//如果严格要求解析没问题，这块可能需要增加一个错误记录机制
+	signal.Notify(c, syscall.SIGSEGV, syscall.SIGBUS)
+
+	go func() {
+		<-c
+		//发送Last Gasp消息
+		if currentFileName != "" {
+			SendLastGaspMessage(currentTaskId, currentTaskType, currentFileName, currentLineNum)
+		}
+		// 退出进程
+		os.Exit(1)
+	}()
+}
+
+// SendLastGaspMessage 往udp里面发送崩溃记录
+func SendLastGaspMessage(taskId int, taskType TaskType, fileName string, lineNum int) {
+	// 创建Last Gasp消息
+	msg := LastGaspMessage{
+		WorkerId:  os.Getpid(),
+		TaskId:    taskId,
+		TaskType:  taskType,
+		FileName:  fileName,
+		LineNum:   lineNum,
+		Timestamp: time.Now().Unix(),
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	conn, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", LAST_GASP_PORT))
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// 发送消息
+	conn.Write(data)
+}
 
 type ByKey []KeyValue
 
@@ -44,6 +101,9 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
+	// 设置信号处理器
+	setupSignalHandler()
+
 	for {
 		task := GetTask()
 		//这个task就是主节点帮我处理好的了
@@ -52,14 +112,23 @@ func Worker(mapf func(string, string) []KeyValue,
 			{
 				task.Status = Working
 				LogInfo("执行Map任务: %d, 文件: %s", task.TaskId, task.FileName)
+				currentTaskId = task.TaskId // 记录当前任务ID
+				currentTaskType = MapTask   // 记录当前任务类型
 				handleMapTask(task, mapf)
+				// 清除当前文件名
+				currentFileName = ""
+				currentLineNum = 0
 				ReportTaskDone(task.TaskId, MapTask)
 			}
 		case ReduceTask:
 			{
 				task.Status = Working
 				LogInfo("执行Reduce任务: %d, ReduceIndex: %d", task.TaskId, task.ReduceIndex)
+				currentTaskId = task.TaskId  // 记录当前任务ID
+				currentTaskType = ReduceTask // 记录当前任务类型
 				handleReduceTask(task, reducef)
+				currentFileName = ""
+				currentLineNum = 0
 				ReportTaskDone(task.TaskId, ReduceTask)
 			}
 		case WaitingTask:
@@ -100,7 +169,7 @@ func handleReduceTask(task Task, reducef func(string, []string) string) {
 	fileCount := 0
 
 	// 尝试读取所有可能的中间文件
-	for i := 0; i < 100; i++ { // 设置上限以避免无限循环
+	for i := 0; i < 100; i++ { // 设计缺陷，这里应该是map乘reduce
 		filename := fmt.Sprintf("mr-%d-%d", i, reduceFileId)
 		file, err := os.Open(filename)
 		if err != nil {
@@ -158,16 +227,37 @@ func handleReduceTask(task Task, reducef func(string, []string) string) {
 			j++
 		}
 
+		key := intermediate[i].Key
+		currentFileName = fmt.Sprintf("reduce-%d-key-%s", task.ReduceIndex, key)
+		// 使用键值对在数组中的索引位置作为"行号"
+		currentLineNum = i
+
 		values := []string{}
 		for k := i; k < j; k++ {
 			values = append(values, intermediate[k].Value)
 		}
 
 		output := reducef(intermediate[i].Key, values)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					LogError("Reduce处理key '%s' 时崩溃: %v", key, r)
+					// 信号处理器将发送Last Gasp消息
+				}
+			}()
 
-		// 输出到文件
-		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
-		outputCount++
+			// 调用用户的reduce函数
+			output = reducef(key, values)
+		}()
+		// 清除当前记录信息
+		currentFileName = ""
+		currentLineNum = 0
+
+		// 如果没有崩溃，输出结果
+		if output != "" {
+			fmt.Fprintf(tempFile, "%v %v\n", key, output)
+			outputCount++
+		}
 
 		i = j
 	}
@@ -185,19 +275,61 @@ func handleReduceTask(task Task, reducef func(string, []string) string) {
 }
 
 func handleMapTask(task Task, mapf func(string, string) []KeyValue) {
+	// 检查文件是否在跳过列表中
+	if task.SkipFiles != nil {
+		for _, skipFile := range task.SkipFiles {
+			if skipFile == task.FileName {
+				LogInfo("跳过已知有问题的文件: %s", task.FileName)
+				return // 跳过此文件的处理
+			}
+		}
+	}
 	//读取文件，执行map，输出文件，
 	file, err := os.Open(task.FileName)
 	if err != nil {
 		LogError("无法打开文件: %s", task.FileName)
 		return
 	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		LogError("无法读取 %v", task.FileName)
+	defer file.Close()
+
+	// 设置当前文件名
+	currentFileName = task.FileName
+	// 使用Scanner跟踪行号
+	scanner := bufio.NewScanner(file)
+	currentLineNum = 0
+	var contentBuilder strings.Builder
+	for scanner.Scan() {
+		currentLineNum++
+		contentBuilder.WriteString(scanner.Text())
+		contentBuilder.WriteString("\n")
+	}
+	// 重置行号计数器，因为我们将处理整个文件
+	currentLineNum = 0
+	contentStr := contentBuilder.String()
+	// 使用defer/recover处理可能的panic
+	var values []KeyValue
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				LogError("处理文件 %s 时崩溃: %v",
+					currentFileName, r)
+				// 信号处理器会发送Last Gasp消息，包含当前行号
+			}
+		}()
+
+		// 调用Map函数处理整个文件
+		values = mapf(task.FileName, contentStr)
+	}()
+
+	// 清除文件名和行号
+	currentFileName = ""
+	currentLineNum = 0
+
+	// 如果发生panic，values可能为nil
+	if values == nil {
 		return
 	}
-	file.Close()
-	values := mapf(task.FileName, string(content))
 
 	//创建中间数据，对于一个文件，有多少reduce就会有多少对应的中间文件
 	intermediates := make([]*os.File, task.ReduceNum)
@@ -242,6 +374,21 @@ func GetTask() Task {
 		LogError("获取任务失败，可能是Coordinator已停止或网络问题")
 	}
 	return resp.Task
+}
+
+// 辅助函数: 检查字符串是否在字符串切片中
+func contains(slice []string, str string) bool {
+	for _, item := range slice {
+		if item == str {
+			return true
+		}
+	}
+	return false
+}
+
+// LogSkippedRecord  打印跳过记录的日志
+func LogSkippedRecord(recordId string) {
+	LogInfo("跳过已知有问题的记录: %s", recordId)
 }
 
 // send an RPC request to the coordinator, wait for the response.

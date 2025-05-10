@@ -22,7 +22,9 @@ type Coordinator struct {
 	mapIndexes     map[int]int           // TaskId -> 在Map任务中的索引位置
 	reduceIndexes  map[int]int           // TaskId -> 在Reduce任务中的索引位置
 	lock           sync.RWMutex
-	done           bool // 标记所有任务是否完成
+	done           bool                   // 标记所有任务是否完成
+	skipFiles      map[string]*SkipRecord // 文件名 -> 跳过记录信息
+	skipLock       sync.RWMutex           // 保护skipFiles的锁
 }
 type TaskMetaInfo struct {
 	state     TaskStatus // 任务的状态
@@ -39,10 +41,11 @@ const (
 
 // 用于持久化的状态结构体
 type CoordinatorState struct {
-	TaskId     int               // 当前任务ID
-	DistPhase  Phase             // 分布式处理阶段
-	TaskStates map[int]TaskState // 任务状态映射
-	Done       bool              // 是否完成
+	TaskId     int                    // 当前任务ID
+	DistPhase  Phase                  // 分布式处理阶段
+	TaskStates map[int]TaskState      // 任务状态映射
+	Done       bool                   // 是否完成
+	SkipFiles  map[string]*SkipRecord // 需要跳过的文件
 }
 
 // 持久化的任务状态
@@ -54,6 +57,71 @@ type TaskState struct {
 	ReduceIndex int        // Reduce任务索引
 }
 
+// 启动监听处理端口
+func (c *Coordinator) startLastGaspServer() {
+	addr := net.UDPAddr{
+		Port: LAST_GASP_PORT,
+		IP:   net.ParseIP("0.0.0.0")}
+	conn, err := net.ListenUDP("udp", &addr)
+	if err != nil {
+		LogError("启动Last Gasp服务器失败: %v", err)
+		return
+	}
+	LogInfo("Last Gasp服务器已启动，监听端口: %d", LAST_GASP_PORT)
+
+	go func() {
+		defer conn.Close()
+
+		buf := make([]byte, 1024)
+		for {
+			n, _, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+
+			// 解析消息
+			var msg LastGaspMessage
+			err = json.Unmarshal(buf[:n], &msg)
+			if err != nil {
+				continue
+			}
+
+			// 处理崩溃报告
+			c.handleCrashReport(msg)
+		}
+	}()
+}
+
+// 处理崩溃报告
+func (c *Coordinator) handleCrashReport(msg LastGaspMessage) {
+	c.skipLock.Lock()
+	defer c.skipLock.Unlock()
+	LogInfo("收到崩溃报告: Worker=%d, Task=%d, File=%s, Line=%d",
+		msg.WorkerId, msg.TaskId, msg.FileName, msg.LineNum)
+	// 检查文件是否已在跳过记录中
+	record, exists := c.skipFiles[msg.FileName]
+
+	if !exists {
+		// 新建跳过记录
+		record = &SkipRecord{
+			FileName:    msg.FileName,
+			CrashCount:  1,
+			FirstCrash:  msg.Timestamp,
+			LatestCrash: msg.Timestamp,
+		}
+		c.skipFiles[msg.FileName] = record
+	} else {
+		// 更新现有记录
+		record.CrashCount++
+		record.LatestCrash = msg.Timestamp
+
+		// 检查是否达到跳过阈值
+		if record.CrashCount >= MAX_CRASHES {
+			LogInfo("文件 %s 已达到跳过阈值 (%d次崩溃), 将在后续任务中跳过",
+				msg.FileName, record.CrashCount)
+		}
+	}
+}
 func (c *Coordinator) ReportTaskCompleted(req *ReportTaskReq, resp *ReportTaskResp) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -123,6 +191,16 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 		c.makeReduceTasks(c.ReduceNum)
 	}
 
+	// 在分配任务之前，添加跳过文件列表
+	c.skipLock.RLock()
+	var skipList []string
+	for fileName, record := range c.skipFiles {
+		if record.CrashCount >= MAX_CRASHES {
+			skipList = append(skipList, fileName)
+		}
+	}
+	c.skipLock.RUnlock()
+
 	// 根据当前阶段分配任务
 	switch c.DistPhase {
 	case MapPhase:
@@ -132,6 +210,8 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			// 设置任务开始时间
 			startTime := time.Now()
 			task.StartTime = startTime
+			// 添加跳过文件列表
+			task.SkipFiles = skipList
 			// 记录任务信息
 			c.TaskMetaHolder[task.TaskId] = &TaskMetaInfo{
 				state:     Working,
@@ -156,7 +236,8 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			// 设置任务开始时间
 			startTime := time.Now()
 			task.StartTime = startTime
-
+			// 添加跳过文件列表
+			task.SkipFiles = skipList
 			// 更新任务状态
 			if info, exists := c.TaskMetaHolder[task.TaskId]; exists {
 				info.state = Working
@@ -317,7 +398,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// 启动超时检查机制
 	c.startTimeoutChecker()
-
+	//启动监听崩溃记录服务器
+	c.startLastGaspServer()
 	// 启动状态持久化机制
 	c.startPersistenceRoutine()
 
@@ -440,6 +522,9 @@ func (c *Coordinator) persistState() {
 		TaskStates: make(map[int]TaskState),
 		Done:       c.done,
 	}
+	c.skipLock.RLock()
+	state.SkipFiles = c.skipFiles
+	c.skipLock.RUnlock()
 
 	// 保存任务状态
 	for id, info := range c.TaskMetaHolder {
@@ -542,8 +627,15 @@ func (c *Coordinator) loadState() bool {
 		} else if task.TaskType == ReduceTask {
 			c.reduceIndexes[id] = task.ReduceIndex
 		}
-	}
 
+	}
+	// 恢复跳过文件信息
+	c.skipLock.Lock()
+	if state.SkipFiles != nil {
+		c.skipFiles = state.SkipFiles
+		LogInfo("恢复了 %d 个需要跳过的文件记录", len(c.skipFiles))
+	}
+	c.skipLock.Unlock()
 	LogInfo("成功从状态文件恢复: 当前阶段=%v, 任务总数=%d", c.DistPhase, len(c.TaskMetaHolder))
 	return true
 }

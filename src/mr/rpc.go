@@ -29,6 +29,7 @@ type Task struct {
 	MapIndex    int       // 存储映射索引
 	ReduceIndex int       // 存储映射索引
 	StartTime   time.Time // 任务开始执行的时间
+	SkipFiles   []string  // 需要跳过的记录ID列表
 }
 
 type ReportTaskReq struct {
