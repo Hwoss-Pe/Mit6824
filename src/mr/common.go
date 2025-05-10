@@ -1,6 +1,6 @@
 package mr
 
-// LastGaspMessage 奔溃信息结构
+// LastGaspMessage 崩溃信息结构
 type LastGaspMessage struct {
 	WorkerId  int      // worker ID
 	TaskId    int      // 任务ID

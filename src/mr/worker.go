@@ -308,7 +308,7 @@ func handleMapTask(task Task, mapf func(string, string) []KeyValue) {
 	contentStr := contentBuilder.String()
 	// 使用defer/recover处理可能的panic
 	var values []KeyValue
-
+	//只会捕获reduce造成的panic，防御编程
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
