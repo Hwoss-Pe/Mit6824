@@ -12,19 +12,24 @@ import (
 )
 
 type Coordinator struct {
-	TaskId         int                   // 作为自增任务id
-	MapChan        chan *Task            //map任务队列
-	ReduceChan     chan *Task            //reduce任务队列
-	ReduceNum      int                   //reduce数量
-	files          []string              //传入文件数组
-	DistPhase      Phase                 //目前框架中处于什么阶段
-	TaskMetaHolder map[int]*TaskMetaInfo //主节点可以掌握所有任务，taskId对应
-	mapIndexes     map[int]int           // TaskId -> 在Map任务中的索引位置
-	reduceIndexes  map[int]int           // TaskId -> 在Reduce任务中的索引位置
-	lock           sync.RWMutex
-	done           bool                   // 标记所有任务是否完成
-	skipFiles      map[string]*SkipRecord // 文件名 -> 跳过记录信息
-	skipLock       sync.RWMutex           // 保护skipFiles的锁
+	TaskId             int                   // 作为自增任务id
+	MapChan            chan *Task            //map任务队列
+	ReduceChan         chan *Task            //reduce任务队列
+	ReduceNum          int                   //reduce数量
+	IncrReduceChan     chan *Task            //增量reduce任务队列
+	files              []string              //传入文件数组
+	DistPhase          Phase                 //目前框架中处于什么阶段
+	TaskMetaHolder     map[int]*TaskMetaInfo //主节点可以掌握所有任务，taskId对应
+	IncrTaskMetaHolder map[int]*TaskMetaInfo //增量reduce的数据
+	mapIndexes         map[int]int           // TaskId -> 在Map任务中的索引位置
+	reduceIndexes      map[int]int           // TaskId -> 在Reduce任务中的索引位置
+	lock               sync.RWMutex
+	done               bool                   // 标记所有任务是否完成
+	skipFiles          map[string]*SkipRecord // 文件名 -> 跳过记录信息
+	skipLock           sync.RWMutex           // 保护skipFiles的锁
+	IncrReduceDone     bool                   // 新增：增量Reduce是否完成
+	CompletedMapTasks  map[int]bool           // 新增：记录完成的Map任务
+	PostIncrMapTasks   map[int]bool           // 新增：增量阶段后完成的Map任务
 }
 type TaskMetaInfo struct {
 	state     TaskStatus // 任务的状态
@@ -35,6 +40,7 @@ type Phase int
 
 const (
 	MapPhase Phase = iota //此阶段在分发MapTask
+	IncrementalReducePhase
 	ReducePhase
 	AllDone //任务分配完成
 )
@@ -126,19 +132,24 @@ func (c *Coordinator) ReportTaskCompleted(req *ReportTaskReq, resp *ReportTaskRe
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	// 根据任务类型更新相应任务的状态
-	if taskInfo, exists := c.TaskMetaHolder[req.TaskId]; exists {
-		// 检查任务类型是否匹配
-		if taskInfo.TaskAdr.TaskType == req.TaskType {
-			// 只有当任务处于进行中状态时才更新
-			if taskInfo.state == Working {
+	// 根据任务类型更新状态
+	if req.TaskType == MapTask || req.TaskType == ReduceTask {
+		if taskInfo, exists := c.TaskMetaHolder[req.TaskId]; exists {
+			if taskInfo.TaskAdr.TaskType == req.TaskType && taskInfo.state == Working {
 				taskInfo.state = Done
+
 				if req.TaskType == MapTask {
 					LogInfo("Map任务 %d 已完成", req.TaskId)
+
+					// 记录增量后完成的Map任务
+					if c.DistPhase == IncrementalReducePhase || c.IncrReduceDone {
+						c.PostIncrMapTasks[req.TaskId] = true
+					}
+
 				} else if req.TaskType == ReduceTask {
 					LogInfo("Reduce任务 %d 已完成", req.TaskId)
 
-					// 检查是否所有Reduce任务都已完成
+					// 检查是否所有Reduce都完成
 					if c.DistPhase == ReducePhase {
 						allDone := true
 						for _, info := range c.TaskMetaHolder {
@@ -148,14 +159,21 @@ func (c *Coordinator) ReportTaskCompleted(req *ReportTaskReq, resp *ReportTaskRe
 							}
 						}
 
-						// 如果所有Reduce任务都完成了，更新阶段状态
 						if allDone {
-							LogInfo("所有Reduce任务已完成，切换到AllDone阶段")
+							LogInfo("所有Reduce任务完成，切换到AllDone阶段")
 							c.DistPhase = AllDone
 							c.done = true
 						}
 					}
 				}
+			}
+		}
+	} else if req.TaskType == IncrementalReduceTask {
+		// 处理增量Reduce任务完成
+		if taskInfo, exists := c.IncrTaskMetaHolder[req.TaskId]; exists {
+			if taskInfo.TaskAdr.TaskType == IncrementalReduceTask && taskInfo.state == Working {
+				taskInfo.state = Done
+				LogInfo("增量Reduce任务 %d 已完成", req.TaskId)
 			}
 		}
 	}
@@ -165,11 +183,15 @@ func (c *Coordinator) ReportTaskCompleted(req *ReportTaskReq, resp *ReportTaskRe
 func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	//  统计任务状态
+
+	// 统计任务状态
 	mapCount := 0
 	mapDone := 0
 	reduceCount := 0
 	reduceDone := 0
+	incrReduceCount := 0
+	incrReduceDone := 0
+
 	for _, info := range c.TaskMetaHolder {
 		if info.TaskAdr.TaskType == MapTask {
 			mapCount++
@@ -184,14 +206,59 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 		}
 	}
 
-	// 检查是否需要切换阶段
+	for _, info := range c.IncrTaskMetaHolder {
+		if info.TaskAdr.TaskType == IncrementalReduceTask {
+			incrReduceCount++
+			if info.state == Done {
+				incrReduceDone++
+			}
+		}
+	}
+
+	// 检查是否触发增量Reduce
+	if c.DistPhase == MapPhase && !c.IncrReduceDone &&
+		mapCount > 0 && float64(mapDone)/float64(mapCount) >= 0.5 {
+		LogInfo("已完成50%%的Map任务，开始增量Reduce")
+		c.DistPhase = IncrementalReducePhase
+
+		// 记录当前已完成的Map任务
+		c.CompletedMapTasks = make(map[int]bool)
+		for taskId, info := range c.TaskMetaHolder {
+			if info.TaskAdr.TaskType == MapTask && info.state == Done {
+				c.CompletedMapTasks[taskId] = true
+			}
+		}
+
+		// 创建增量Reduce任务
+		c.makeIncrementalReduceTasks(c.ReduceNum)
+	}
+
+	// 检查增量Reduce是否全部完成
+	if c.DistPhase == IncrementalReducePhase &&
+		incrReduceCount > 0 && incrReduceCount == incrReduceDone &&
+		len(c.IncrReduceChan) == 0 {
+		c.IncrReduceDone = true
+
+		// 如果所有Map任务也完成了，进入最终Reduce阶段
+		if mapCount == mapDone && len(c.MapChan) == 0 {
+			LogInfo("所有Map和增量Reduce完成，开始最终Reduce阶段")
+			c.DistPhase = ReducePhase
+			c.makeReduceTasks(c.ReduceNum)
+		} else {
+			// 否则回到Map阶段完成剩余任务
+			LogInfo("增量Reduce完成，返回处理剩余Map任务")
+			c.DistPhase = MapPhase
+		}
+	}
+
+	// 原有的阶段转换检查
 	if c.DistPhase == MapPhase && mapCount > 0 && mapCount == mapDone && len(c.MapChan) == 0 {
-		LogInfo("所有Map任务都已完成，切换到Reduce阶段")
+		LogInfo("所有Map任务完成，开始Reduce阶段")
 		c.DistPhase = ReducePhase
 		c.makeReduceTasks(c.ReduceNum)
 	}
 
-	// 在分配任务之前，添加跳过文件列表
+	// 获取跳过文件列表
 	c.skipLock.RLock()
 	var skipList []string
 	for fileName, record := range c.skipFiles {
@@ -204,64 +271,103 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 	// 根据当前阶段分配任务
 	switch c.DistPhase {
 	case MapPhase:
-		// 处理Map阶段的任务分配
+		// 正常分配Map任务
 		if len(c.MapChan) > 0 {
 			task := <-c.MapChan
-			// 设置任务开始时间
 			startTime := time.Now()
 			task.StartTime = startTime
-			// 添加跳过文件列表
 			task.SkipFiles = skipList
-			// 记录任务信息
 			c.TaskMetaHolder[task.TaskId] = &TaskMetaInfo{
 				state:     Working,
 				TaskAdr:   task,
 				StartTime: startTime,
 			}
 			reply.Task = *task
-			LogDebug("分配Map任务: %d", task.TaskId)
-			return nil
-		} else {
-			// 没有可用任务，等待
-			reply.Task = Task{
-				TaskType: WaitingTask,
-			}
 			return nil
 		}
-	case ReducePhase:
-		// 优先从ReduceChan获取任务
-		if len(c.ReduceChan) > 0 {
-			task := <-c.ReduceChan
 
-			// 设置任务开始时间
+	case IncrementalReducePhase:
+		// 优先分配增量Reduce任务
+		if len(c.IncrReduceChan) > 0 {
+			task := <-c.IncrReduceChan
 			startTime := time.Now()
 			task.StartTime = startTime
-			// 添加跳过文件列表
 			task.SkipFiles = skipList
-			// 更新任务状态
+
+			// 添加已完成Map任务信息
+			completedMaps := make([]int, 0)
+			for taskId := range c.CompletedMapTasks {
+				completedMaps = append(completedMaps, c.mapIndexes[taskId])
+			}
+			task.CompletedMaps = completedMaps
+
+			c.IncrTaskMetaHolder[task.TaskId] = &TaskMetaInfo{
+				state:     Working,
+				TaskAdr:   task,
+				StartTime: startTime,
+			}
+			reply.Task = *task
+			return nil
+		}
+
+		// 如果没有增量Reduce任务，尝试分配剩余Map任务
+		if len(c.MapChan) > 0 {
+			task := <-c.MapChan
+			startTime := time.Now()
+			task.StartTime = startTime
+			task.SkipFiles = skipList
+			c.TaskMetaHolder[task.TaskId] = &TaskMetaInfo{
+				state:     Working,
+				TaskAdr:   task,
+				StartTime: startTime,
+			}
+			reply.Task = *task
+			return nil
+		}
+
+	case ReducePhase:
+		// 分配正常Reduce任务
+		if len(c.ReduceChan) > 0 {
+			task := <-c.ReduceChan
+			startTime := time.Now()
+			task.StartTime = startTime
+			task.SkipFiles = skipList
+
+			// 设置增量后完成的Map任务
+			if c.IncrReduceDone {
+				postMaps := make([]int, 0)
+				for taskId, info := range c.TaskMetaHolder {
+					if info.TaskAdr.TaskType == MapTask && info.state == Done &&
+						!c.CompletedMapTasks[taskId] {
+						postMaps = append(postMaps, c.mapIndexes[taskId])
+					}
+				}
+				task.CompletedMaps = postMaps
+			}
+
 			if info, exists := c.TaskMetaHolder[task.TaskId]; exists {
 				info.state = Working
 				info.StartTime = startTime
 			}
 
 			reply.Task = *task
-			LogDebug("分配Reduce任务: ID=%d, ReduceIndex=%d", task.TaskId, task.ReduceIndex)
 			return nil
 		}
-		// 备用方案：直接从TaskMetaHolder查找未分配的Reduce任务
-		for id, info := range c.TaskMetaHolder {
+
+		// 备用方案
+		for _, info := range c.TaskMetaHolder {
 			if info.TaskAdr.TaskType == ReduceTask && info.state == Waiting {
-				// 找到一个等待中的Reduce任务
+				// 找到等待的Reduce任务...
 				startTime := time.Now()
 				info.state = Working
 				info.StartTime = startTime
 				info.TaskAdr.StartTime = startTime
 				reply.Task = *info.TaskAdr
-				LogDebug("备用方案: 分配Reduce任务: ID=%d, ReduceIndex=%d", id, info.TaskAdr.ReduceIndex)
 				return nil
 			}
 		}
-		// 检查是否所有Reduce任务都已完成
+
+		// 检查是否所有Reduce都完成
 		allDone := true
 		for _, info := range c.TaskMetaHolder {
 			if info.TaskAdr.TaskType == ReduceTask && info.state != Done {
@@ -269,35 +375,58 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 				break
 			}
 		}
-		if allDone && reduceCount > 0 {
-			// 所有Reduce任务都完成了
-			LogInfo("所有Reduce任务已完成，切换到AllDone阶段")
-			c.DistPhase = AllDone
-			c.done = true // 设置完成标志
 
-			// 分配退出任务
-			reply.Task = Task{
-				TaskType: ExitTask,
-			}
-			return nil
-		} else {
-			// 可能有正在进行中的Reduce任务，返回等待任务
-			reply.Task = Task{
-				TaskType: WaitingTask,
-			}
+		if allDone {
+			LogInfo("所有Reduce任务完成，准备结束")
+			c.DistPhase = AllDone
+			c.done = true
+			reply.Task = Task{TaskType: ExitTask}
 			return nil
 		}
+
 	case AllDone:
-		// 所有任务都已完成，返回退出任务
-		reply.Task = Task{
-			TaskType: ExitTask,
-		}
+		reply.Task = Task{TaskType: ExitTask}
 		return nil
-	default:
-		reply.Task = Task{
-			TaskType: WaitingTask,
+	}
+
+	// 如果没有任务可分配，返回等待任务
+	reply.Task = Task{TaskType: WaitingTask}
+	return nil
+}
+
+// 创建增量Reduce任务
+func (c *Coordinator) makeIncrementalReduceTasks(nReduce int) {
+	LogInfo("初始化 %d 个增量Reduce任务", nReduce)
+
+	// 初始化增量任务通道
+	if c.IncrReduceChan == nil {
+		c.IncrReduceChan = make(chan *Task, nReduce)
+	}
+
+	// 初始化增量任务元数据
+	if c.IncrTaskMetaHolder == nil {
+		c.IncrTaskMetaHolder = make(map[int]*TaskMetaInfo)
+	}
+
+	// 创建任务
+	for i := 0; i < nReduce; i++ {
+		taskId := c.generateId()
+
+		task := &Task{
+			TaskId:        taskId,
+			TaskType:      IncrementalReduceTask,
+			Status:        Waiting,
+			ReduceNum:     c.ReduceNum,
+			ReduceIndex:   i,
+			IsIncremental: true,
 		}
-		return nil
+
+		c.IncrTaskMetaHolder[taskId] = &TaskMetaInfo{
+			state:   Waiting,
+			TaskAdr: task,
+		}
+
+		c.IncrReduceChan <- task
 	}
 }
 

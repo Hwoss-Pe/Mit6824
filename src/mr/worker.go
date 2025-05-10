@@ -98,53 +98,300 @@ func ihash(key string) int {
 }
 
 // Worker 启动后就会调用这个函数，那么就要他去不断的获取任务，直到那边说我不用干了
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	// 设置信号处理器
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 	setupSignalHandler()
 
 	for {
 		task := GetTask()
-		//这个task就是主节点帮我处理好的了
+
 		switch task.TaskType {
 		case MapTask:
-			{
-				task.Status = Working
-				LogInfo("执行Map任务: %d, 文件: %s", task.TaskId, task.FileName)
-				currentTaskId = task.TaskId // 记录当前任务ID
-				currentTaskType = MapTask   // 记录当前任务类型
-				handleMapTask(task, mapf)
-				// 清除当前文件名
-				currentFileName = ""
-				currentLineNum = 0
-				ReportTaskDone(task.TaskId, MapTask)
-			}
+			task.Status = Working
+			LogInfo("执行Map任务: %d, 文件: %s", task.TaskId, task.FileName)
+			currentTaskId = task.TaskId
+			currentTaskType = MapTask
+			handleMapTask(task, mapf)
+			currentFileName = ""
+			currentLineNum = 0
+			ReportTaskDone(task.TaskId, MapTask)
+
+		case IncrementalReduceTask:
+			task.Status = Working
+			LogInfo("执行增量Reduce任务: %d, ReduceIndex: %d", task.TaskId, task.ReduceIndex)
+			currentTaskId = task.TaskId
+			currentTaskType = IncrementalReduceTask
+			handleIncrementalReduceTask(task, reducef)
+			currentFileName = ""
+			currentLineNum = 0
+			ReportTaskDone(task.TaskId, IncrementalReduceTask)
+
 		case ReduceTask:
-			{
-				task.Status = Working
-				LogInfo("执行Reduce任务: %d, ReduceIndex: %d", task.TaskId, task.ReduceIndex)
-				currentTaskId = task.TaskId  // 记录当前任务ID
-				currentTaskType = ReduceTask // 记录当前任务类型
-				handleReduceTask(task, reducef)
-				currentFileName = ""
-				currentLineNum = 0
-				ReportTaskDone(task.TaskId, ReduceTask)
-			}
+			task.Status = Working
+			LogInfo("执行最终Reduce任务: %d, ReduceIndex: %d", task.TaskId, task.ReduceIndex)
+			currentTaskId = task.TaskId
+			currentTaskType = ReduceTask
+			handleFinalReduceTask(task, reducef)
+			currentFileName = ""
+			currentLineNum = 0
+			ReportTaskDone(task.TaskId, ReduceTask)
+
 		case WaitingTask:
 			time.Sleep(time.Second)
+
 		case ExitTask:
-			{
-				LogInfo("所有任务都已完成，worker退出")
-				return
-			}
+			LogInfo("所有任务都已完成，worker退出")
+			return
+
 		default:
-			{
-				LogError("信号未知，直接退出")
-				return
-			}
+			LogError("信号未知，直接退出")
+			return
 		}
 	}
+}
+
+// 处理最终Reduce任务
+func handleFinalReduceTask(task Task, reducef func(string, []string) string) {
+	reduceIdx := task.ReduceIndex
+	LogDebug("最终Reduce任务[%d]开始处理", task.TaskId)
+
+	// 1. 读取所有增量后完成的Map任务生成的中间文件
+	intermediate := []KeyValue{}
+
+	// 如果有增量阶段，只读取增量后完成的Map任务文件
+	if task.CompletedMaps != nil && len(task.CompletedMaps) > 0 {
+		for _, mapIdx := range task.CompletedMaps {
+			filename := fmt.Sprintf("mr-%d-%d", mapIdx, reduceIdx)
+			file, err := os.Open(filename)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					LogError("打开文件 %s 失败: %v", filename, err)
+				}
+				continue
+			}
+
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					if err != io.EOF {
+						LogError("解码文件 %s 出错: %v", filename, err)
+					}
+					break
+				}
+				intermediate = append(intermediate, kv)
+			}
+
+			file.Close()
+		}
+	} else {
+		// 没有增量阶段，读取所有可能的中间文件
+		for i := 0; i < 100; i++ {
+			filename := fmt.Sprintf("mr-%d-%d", i, reduceIdx)
+			file, err := os.Open(filename)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					LogError("打开文件 %s 失败: %v", filename, err)
+				}
+				continue
+			}
+
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					if err != io.EOF {
+						LogError("解码文件 %s 出错: %v", filename, err)
+					}
+					break
+				}
+				intermediate = append(intermediate, kv)
+			}
+
+			file.Close()
+		}
+	}
+
+	// 2. 读取增量结果文件
+	incrRawName := fmt.Sprintf("mr-incr-raw-%d", reduceIdx)
+	rawKVs := make(map[string][]string)
+
+	if file, err := os.Open(incrRawName); err == nil {
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.SplitN(line, "\t", 2)
+			if len(parts) == 2 {
+				key := parts[0]
+				var values []string
+				json.Unmarshal([]byte(parts[1]), &values)
+				rawKVs[key] = values
+			}
+		}
+		file.Close()
+	}
+
+	// 3. 创建最终输出文件
+	oname := fmt.Sprintf("mr-out-%d", reduceIdx)
+	tempFile, err := ioutil.TempFile("", "reduce-*")
+	if err != nil {
+		LogError("无法创建临时文件: %v", err)
+		return
+	}
+
+	// 4. 合并增量结果和新数据
+	newKVs := make(map[string][]string)
+
+	// 收集新数据中的键值对
+	for _, kv := range intermediate {
+		newKVs[kv.Key] = append(newKVs[kv.Key], kv.Value)
+	}
+
+	// 合并所有键
+	allKeys := make(map[string]bool)
+	for k := range rawKVs {
+		allKeys[k] = true
+	}
+	for k := range newKVs {
+		allKeys[k] = true
+	}
+
+	// 处理每个键
+	for key := range allKeys {
+		var values []string
+
+		// 合并增量结果中的值
+		if incrValues, exists := rawKVs[key]; exists {
+			values = append(values, incrValues...)
+		}
+
+		// 合并新数据中的值
+		if newValues, exists := newKVs[key]; exists {
+			values = append(values, newValues...)
+		}
+
+		// 应用Reduce函数
+		if len(values) > 0 {
+			output := reducef(key, values)
+			fmt.Fprintf(tempFile, "%v %v\n", key, output)
+		}
+	}
+
+	// 关闭并重命名文件
+	tempFile.Close()
+	os.Rename(tempFile.Name(), oname)
+
+	LogInfo("最终Reduce任务[%d]完成", task.TaskId)
+}
+
+// 处理增量Reduce任务
+func handleIncrementalReduceTask(task Task, reducef func(string, []string) string) {
+	reduceIdx := task.ReduceIndex
+	LogDebug("增量Reduce任务[%d]开始处理", task.TaskId)
+
+	intermediate := []KeyValue{}
+	fileCount := 0
+
+	// 只读取已完成Map任务的中间文件
+	for _, mapIdx := range task.CompletedMaps {
+		filename := fmt.Sprintf("mr-%d-%d", mapIdx, reduceIdx)
+		file, err := os.Open(filename)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				LogError("打开文件 %s 失败: %v", filename, err)
+			}
+			continue
+		}
+
+		fileCount++
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				if err != io.EOF {
+					LogError("解码文件 %s 出错: %v", filename, err)
+				}
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+
+		file.Close()
+	}
+
+	if len(intermediate) == 0 {
+		LogInfo("增量Reduce任务[%d]没有找到数据", task.TaskId)
+		return
+	}
+
+	// 按key排序
+	sort.Sort(ByKey(intermediate))
+
+	// 创建增量结果文件
+	incrName := fmt.Sprintf("mr-incr-%d", reduceIdx)
+	incrRawName := fmt.Sprintf("mr-incr-raw-%d", reduceIdx)
+
+	tempFile, err := ioutil.TempFile("", "incr-reduce-*")
+	if err != nil {
+		LogError("无法创建临时文件: %v", err)
+		return
+	}
+
+	rawTempFile, err := ioutil.TempFile("", "incr-raw-*")
+	if err != nil {
+		LogError("无法创建原始值临时文件: %v", err)
+		tempFile.Close()
+		return
+	}
+
+	// 处理数据，保存结果和原始值
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		key := intermediate[i].Key
+		currentFileName = fmt.Sprintf("incr-reduce-%d-key-%s", task.ReduceIndex, key)
+		currentLineNum = i
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+
+		// 保存原始值列表到raw文件
+		rawValues, _ := json.Marshal(values)
+		fmt.Fprintf(rawTempFile, "%s\t%s\n", key, string(rawValues))
+
+		// 应用Reduce函数并保存结果
+		output := ""
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					LogError("增量Reduce处理key '%s' 时崩溃: %v", key, r)
+				}
+			}()
+
+			output = reducef(key, values)
+		}()
+
+		if output != "" {
+			fmt.Fprintf(tempFile, "%v %v\n", key, output)
+		}
+
+		i = j
+	}
+
+	// 关闭并重命名文件
+	tempFile.Close()
+	rawTempFile.Close()
+
+	os.Rename(tempFile.Name(), incrName)
+	os.Rename(rawTempFile.Name(), incrRawName)
+
+	LogInfo("增量Reduce任务[%d]完成", task.TaskId)
 }
 
 // ReportTaskDone 需要告诉他我处理完了，然后更改那边的状态表

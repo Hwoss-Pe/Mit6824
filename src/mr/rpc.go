@@ -21,15 +21,17 @@ type GetTaskResp struct {
 	Task Task
 }
 type Task struct {
-	TaskId      int
-	TaskType    TaskType   // 0,1,2 分别对应未知，map，reduce
-	Status      TaskStatus // start process finish 三个状态
-	ReduceNum   int
-	FileName    string    //这玩意来固定我的map任务大小
-	MapIndex    int       // 存储映射索引
-	ReduceIndex int       // 存储映射索引
-	StartTime   time.Time // 任务开始执行的时间
-	SkipFiles   []string  // 需要跳过的记录ID列表
+	TaskId        int
+	TaskType      TaskType   // 0,1,2 分别对应未知，map，reduce
+	Status        TaskStatus // start process finish 三个状态
+	ReduceNum     int
+	FileName      string    //这玩意来固定我的map任务大小
+	MapIndex      int       // 存储映射索引
+	ReduceIndex   int       // 存储映射索引
+	StartTime     time.Time // 任务开始执行的时间
+	SkipFiles     []string  // 需要跳过的记录ID列表
+	IsIncremental bool      // 是否为增量任务
+	CompletedMaps []int     // 已完成的Map任务ID列表
 }
 
 type ReportTaskReq struct {
@@ -44,6 +46,7 @@ type TaskType int
 const ( // 这个是记录某个任务的本身
 	WaitingTask TaskType = iota //表示切换状态的时候，从map切换reduce还有在跑的
 	MapTask
+	IncrementalReduceTask //
 	ReduceTask
 	ExitTask //所有任务完成了
 )
