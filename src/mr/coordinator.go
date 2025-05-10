@@ -27,9 +27,9 @@ type Coordinator struct {
 	done               bool                   // 标记所有任务是否完成
 	skipFiles          map[string]*SkipRecord // 文件名 -> 跳过记录信息
 	skipLock           sync.RWMutex           // 保护skipFiles的锁
-	IncrReduceDone     bool                   // 新增：增量Reduce是否完成
-	CompletedMapTasks  map[int]bool           // 新增：记录完成的Map任务
-	PostIncrMapTasks   map[int]bool           // 新增：增量阶段后完成的Map任务
+	IncrReduceDone     bool                   // 增量Reduce是否完成
+	CompletedMapTasks  map[int]bool           // 记录完成的Map任务
+	PostIncrMapTasks   map[int]bool           // 增量阶段后完成的Map任务
 }
 type TaskMetaInfo struct {
 	state     TaskStatus // 任务的状态
