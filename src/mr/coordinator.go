@@ -334,6 +334,7 @@ func (c *Coordinator) GetTask(req *GetTaskReq, reply *GetTaskResp) error {
 			task.SkipFiles = skipList
 
 			// 设置增量后完成的Map任务
+			//这个在进入转换阶段进入增量阶段前就会第一次遍历保存增量阶段之前运行的map任务
 			if c.IncrReduceDone {
 				postMaps := make([]int, 0)
 				for taskId, info := range c.TaskMetaHolder {
@@ -500,15 +501,21 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// 创建基础的Coordinator结构
 	c := Coordinator{
-		files:          files,
-		ReduceNum:      nReduce,
-		MapChan:        make(chan *Task, len(files)),
-		ReduceChan:     make(chan *Task, nReduce),
-		lock:           sync.RWMutex{},
-		TaskMetaHolder: make(map[int]*TaskMetaInfo),
-		mapIndexes:     make(map[int]int),
-		reduceIndexes:  make(map[int]int),
-		done:           false,
+		files:              files,
+		ReduceNum:          nReduce,
+		MapChan:            make(chan *Task, len(files)),
+		ReduceChan:         make(chan *Task, nReduce),
+		IncrReduceChan:     make(chan *Task, nReduce),
+		IncrTaskMetaHolder: make(map[int]*TaskMetaInfo),
+		lock:               sync.RWMutex{},
+		skipLock:           sync.RWMutex{},
+		skipFiles:          map[string]*SkipRecord{},
+		CompletedMapTasks:  make(map[int]bool),
+		PostIncrMapTasks:   make(map[int]bool),
+		TaskMetaHolder:     make(map[int]*TaskMetaInfo),
+		mapIndexes:         make(map[int]int),
+		reduceIndexes:      make(map[int]int),
+		done:               false,
 	}
 
 	// 尝试从持久化状态恢复

@@ -31,7 +31,7 @@ type Task struct {
 	StartTime     time.Time // 任务开始执行的时间
 	SkipFiles     []string  // 需要跳过的记录ID列表
 	IsIncremental bool      // 是否为增量任务
-	CompletedMaps []int     // 已完成的Map任务ID列表
+	CompletedMaps []int     // 增量后已完成的Map任务ID列表
 }
 
 type ReportTaskReq struct {

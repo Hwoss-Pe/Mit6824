@@ -185,7 +185,7 @@ func handleFinalReduceTask(task Task, reducef func(string, []string) string) {
 		}
 	} else {
 		// 没有增量阶段，读取所有可能的中间文件
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 100; i++ { //这个100应该是多少个map的数据，设计缺陷懒得改
 			filename := fmt.Sprintf("mr-%d-%d", i, reduceIdx)
 			file, err := os.Open(filename)
 			if err != nil {
@@ -219,8 +219,9 @@ func handleFinalReduceTask(task Task, reducef func(string, []string) string) {
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			line := scanner.Text()
+			//这里的数据已经是key和value一行一个了
 			parts := strings.SplitN(line, "\t", 2)
-			if len(parts) == 2 {
+			if len(parts) == 2 { //注意这个values有可能是1，1 他就一起被序列化了["1", "1"] 转为 JSON字符串 "[\"1\",\"1\"]"
 				key := parts[0]
 				var values []string
 				json.Unmarshal([]byte(parts[1]), &values)
@@ -261,14 +262,14 @@ func handleFinalReduceTask(task Task, reducef func(string, []string) string) {
 
 		// 合并增量结果中的值
 		if incrValues, exists := rawKVs[key]; exists {
-			values = append(values, incrValues...)
+			values = append(values, incrValues...) //这里保存
 		}
 
 		// 合并新数据中的值
 		if newValues, exists := newKVs[key]; exists {
 			values = append(values, newValues...)
 		}
-
+		//这里做的就是吧不同的比如1，1。和1，1变成1，1，1，1
 		// 应用Reduce函数
 		if len(values) > 0 {
 			output := reducef(key, values)
