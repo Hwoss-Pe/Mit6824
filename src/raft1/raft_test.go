@@ -34,7 +34,6 @@ func TestInitialElection3A(t *testing.T) {
 
 	// is a leader elected?
 	ts.checkOneLeader()
-
 	// sleep a bit to avoid racing with followers learning of the
 	// election, then check that all peers agree on the term.
 	time.Sleep(50 * time.Millisecond)

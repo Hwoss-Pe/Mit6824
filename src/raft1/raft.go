@@ -35,11 +35,13 @@ type Raft struct {
 	lastApplied int
 	//领导者才有的字段
 	nextIndex  []int
-	matchIndex []int
+	matchIndex []int //每一个服务器已经复制到该服务器的最大索引号(初始化为0，单调递增)
 
 	state         string // 服务器状态："follower"、"candidate"或"leader"
 	lastHeartbeat time.Time
 	votesReceived int // 选举中收到的投票数
+
+	applyCh chan raftapi.ApplyMsg //3b中用于向应用发送已经提交的命令
 }
 
 type LogEntry struct {
@@ -240,13 +242,93 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // 第二个返回值是当前任期。
 // 第三个返回值为 true，表示该服务器认为自己是领导者。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	//写操作必须走主节点
+	if rf.state != "leader" {
+		return -1, -1, false
+	}
+	index := len(rf.logs)
+	term := rf.currentTerm
+	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
 
-	// 你的代码在这里 (3B)
+	rf.persist()
 
-	return index, term, isLeader
+	// 立即开始向跟随者复制日志
+	go rf.startAppendEntries()
+
+	return index, term, true
+
+}
+
+func (rf *Raft) startAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != "leader" {
+		return
+	}
+
+	// 触发向所有服务器发送日志
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.sendLogEntries(i)
+		}
+	}
+}
+
+func (rf *Raft) sendLogEntries(server int) {
+	rf.mu.Lock()
+	if rf.state != "leader" {
+		rf.mu.Unlock()
+		return
+	}
+
+	prevLogIndex := rf.nextIndex[server] - 1
+	prevLogTerm := rf.logs[prevLogIndex].Term
+	//如果档案记录的节点下一个日志小于目前主节点拥有的日志，那么应该发送后面一段该节点没有的
+	entries := make([]LogEntry, 0)
+	if rf.nextIndex[server] < len(rf.logs) {
+		entries = append(entries, rf.logs[rf.nextIndex[server]:]...)
+	}
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		Entries:      entries,
+		PrevLogIndex: prevLogIndex,
+		LeaderCommit: rf.commitIndex,
+		PrevLogTerm:  prevLogTerm}
+	// 记录当前的任期，用于后续检查
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		//每次操作都要对leader状态进行确认
+		if reply.Term > currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = "follower"
+			rf.votedFor = -1
+			rf.persist()
+			return
+		}
+		//如果写入成功，就更新nextIndex和matchIndex，不成功就降低nextIndex然后异步重试
+		if reply.Success {
+			rf.nextIndex[server] = rf.matchIndex[server] + 1
+			rf.matchIndex[server] = prevLogIndex + len(entries)
+			//这里需要检查是否有新的日志可以提交
+			rf.updateCommitIndex()
+		} else {
+			if rf.nextIndex[server] > 1 {
+				rf.nextIndex[server]--
+			}
+			// 重试
+			go rf.sendLogEntries(server)
+		}
+
+	}
 }
 
 // 测试器不会在每次测试后停止由 Raft 创建的 goroutine，
@@ -388,6 +470,7 @@ func (rf *Raft) startElection() {
 						// 立即发送心跳以建立权威
 						go rf.startHeartbeats()
 					}
+
 				}
 			}
 		}(i, currentTerm)
@@ -516,13 +599,79 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		return
 	}
-
-	// 实际日志复制逻辑将在3B部分实现
-	// ...
+	//日志一致性检查，保证跟随者最后一个日志至少大于preIndex并且任期得一样
+	if args.PrevLogIndex >= len(rf.logs) {
+		// 跟随者日志比prevLogIndex短，失败
+		reply.Success = false
+		return
+	}
+	if args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// prevLogIndex位置的任期不匹配，失败
+		reply.Success = false
+		return
+	}
+	reply.Success = true
+	//追加日志，注意用截取的方式
+	if len(args.Entries) > 0 {
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = append(rf.logs, args.Entries...)
+		rf.persist()
+	}
+	// 更新commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1) //怎么理解
+		// 应用新提交的日志到状态机
+		go rf.applyLogs()
+	}
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) applyLogs() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock() // 应用所有已提交但未应用的日志
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		applyMsg := raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      rf.logs[i].Command,
+			CommandIndex: i,
+		}
+
+		// 解锁再发送，避免死锁
+		rf.mu.Unlock()
+		rf.applyCh <- applyMsg
+		rf.mu.Lock()
+		rf.lastApplied = i
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	// 领导者查找可以提交的最高日志索引，保证大多数都有这个日志才能提交。
+	// 注意：只考虑当前任期的日志条目
+	for i := rf.commitIndex + 1; i < len(rf.logs); i++ {
+		if rf.logs[i].Term == rf.currentTerm {
+			// 计算已复制到大多数服务器的日志
+			count := 1 // 领导者自己
+			for peer := range rf.peers {
+				if peer != rf.me && rf.matchIndex[peer] >= i {
+					count++
+				}
+			}
+			// 如果大多数服务器已复制，则提交
+			if count > len(rf.peers)/2 {
+				rf.commitIndex = i
+			} else {
+				// 如果这个索引未达到多数，后面的也不会达到
+				break
+			}
+		}
+	}
+	// 应用新提交的日志
+	if rf.lastApplied < rf.commitIndex {
+		go rf.applyLogs()
+	}
 }
 
 // applyCh 是测试器或服务期望 Raft
@@ -541,15 +690,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.state = "follower"
 	rf.lastHeartbeat = time.Now() // 初始化心跳时间为当前时间
-
-	// 初始化日志（从索引1开始，索引0存放哨兵值）
-	rf.logs = make([]LogEntry, 0)
-	rf.logs = append(rf.logs, LogEntry{nil, 0})
-
-	// 初始化索引
+	rf.logs = make([]LogEntry, 1) // 创建带有哨兵值的日志数组
+	rf.logs[0] = LogEntry{nil, 0} // 索引0的哨兵日志
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-
+	rf.applyCh = applyCh
 	// 这些变量只有在成为领导者时才会初始化
 	rf.nextIndex = nil
 	rf.matchIndex = nil
