@@ -135,19 +135,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 
-	fmt.Printf("Server %d: Received RequestVote from %d, candidateTerm=%d, myTerm=%d, myVotedFor=%d\n",
+	fmt.Printf("服务器 %d: 收到来自 %d 的RequestVote, 候选人任期=%d, 我的任期=%d, 我的投票=%d\n",
 		rf.me, args.CandidateId, args.Term, rf.currentTerm, rf.votedFor)
 
-	// 如果请求的任期小于当前任期，拒绝投票
+	// 规则1: 如果请求的任期小于当前任期，拒绝投票
 	if args.Term < rf.currentTerm {
-		fmt.Printf("Server %d: Rejecting vote for %d (lower term %d < %d)\n",
+		fmt.Printf("服务器 %d: 拒绝给 %d 投票 (更低的任期 %d < %d)\n",
 			rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		return
 	}
 
 	// 如果请求的任期更高，转为follower
 	if args.Term > rf.currentTerm {
-		fmt.Printf("Server %d: Converting to follower due to RequestVote with higher term %d > %d\n",
+		fmt.Printf("服务器 %d: 由于收到更高任期的RequestVote %d > %d，转为跟随者\n",
 			rf.me, args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
 		rf.state = "follower"
@@ -158,27 +158,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 更新回复中的任期
 	reply.Term = rf.currentTerm
 
-	// 检查是否已经投票
+	// 规则2: 如果votedFor为空或已经投票给候选人，且候选人的日志至少与接收者的一样新，则投票
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		// 比较日志新旧
+		// 获取本地最后一条日志的信息
 		lastLogIndex := len(rf.logs) - 1
 		lastLogTerm := 0
 		if lastLogIndex >= 0 {
 			lastLogTerm = rf.logs[lastLogIndex].Term
 		}
 
-		// 检查日志的新旧比较
-		logOk := false
+		// 严格按照Raft论文5.4.1节实现日志比较:
+		// 1. 如果最后日志任期不同，则比较任期
+		// 2. 如果最后日志任期相同，则比较日志长度
+		// 投票给"更新"的日志（任期高的，或任期相同但更长的）
+		logIsUpToDate := false
+
 		if args.LastLogTerm > lastLogTerm {
-			logOk = true
+			// 候选人的最后日志任期更高
+			logIsUpToDate = true
+			fmt.Printf("服务器 %d: 候选人 %d 的日志任期更高 (%d > %d)\n",
+				rf.me, args.CandidateId, args.LastLogTerm, lastLogTerm)
 		} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
-			logOk = true
+			// 任期相同，但候选人的日志长度更长或相等
+			logIsUpToDate = true
+			fmt.Printf("服务器 %d: 候选人 %d 的日志任期相同但长度更长或相等 (%d >= %d)\n",
+				rf.me, args.CandidateId, args.LastLogIndex, lastLogIndex)
+		} else {
+			fmt.Printf("服务器 %d: 候选人 %d 的日志较旧 (任期:%d vs %d, 长度:%d vs %d)\n",
+				rf.me, args.CandidateId, args.LastLogTerm, lastLogTerm, args.LastLogIndex, lastLogIndex)
 		}
 
-		fmt.Printf("Server %d: Log comparison for %d - myLastTerm=%d, candidateLastTerm=%d, logOk=%v\n",
-			rf.me, args.CandidateId, lastLogTerm, args.LastLogTerm, logOk)
+		fmt.Printf("服务器 %d: 给 %d 的日志比较 - 我的最后任期=%d, 候选人最后任期=%d, 日志OK=%v\n",
+			rf.me, args.CandidateId, lastLogTerm, args.LastLogTerm, logIsUpToDate)
 
-		if logOk {
+		if logIsUpToDate {
 			// 投票给候选人
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
@@ -187,12 +200,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// 重置选举超时计时器
 			rf.lastHeartbeat = time.Now()
 
-			fmt.Printf("Server %d: Voting for %d for term %d\n", rf.me, args.CandidateId, rf.currentTerm)
+			fmt.Printf("服务器 %d: 在任期 %d 中投票给 %d\n", rf.me, rf.currentTerm, args.CandidateId)
 		} else {
-			fmt.Printf("Server %d: Rejecting vote for %d due to older log\n", rf.me, args.CandidateId)
+			fmt.Printf("服务器 %d: 由于日志较旧拒绝给 %d 投票\n", rf.me, args.CandidateId)
 		}
 	} else {
-		fmt.Printf("Server %d: Already voted for %d, can't vote for %d\n",
+		fmt.Printf("服务器 %d: 已经投票给 %d, 不能再投票给 %d\n",
 			rf.me, rf.votedFor, args.CandidateId)
 	}
 }
@@ -224,9 +237,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // 调用者使用 & 传递回复结构体的地址，而不是
 // 结构体本身。
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	fmt.Printf("Server %d: Actually sending RequestVote RPC to server %d\n", rf.me, server)
+	fmt.Printf("服务器 %d: 实际发送RequestVote RPC给服务器 %d\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	fmt.Printf("Server %d: RequestVote RPC to server %d returned %v\n", rf.me, server, ok)
+	fmt.Printf("服务器 %d: 发送给服务器 %d 的RequestVote RPC返回 %v\n", rf.me, server, ok)
 	return ok
 }
 
@@ -244,34 +257,49 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	//写操作必须走主节点
 	if rf.state != "leader" {
 		return -1, -1, false
 	}
-	index := len(rf.logs)
+
+	// 添加新日志条目
+	// 注意：logs[0]是哨兵条目，所以新日志的实际索引是len(rf.logs)
+	rf.logs = append(rf.logs, LogEntry{Term: rf.currentTerm, Command: command})
+	index := len(rf.logs) - 1 // 新日志的索引
 	term := rf.currentTerm
-	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+
+	// 更新matchIndex以考虑新的日志
+	rf.matchIndex[rf.me] = index
+
+	fmt.Printf("领导者 %d: 在索引 %d 添加新日志条目，命令 %v\n", rf.me, index, command)
 
 	rf.persist()
 
-	// 立即开始向跟随者复制日志
+	// 在返回前触发异步复制，但确保在锁释放后进行
 	go rf.startAppendEntries()
 
 	return index, term, true
-
 }
 
 func (rf *Raft) startAppendEntries() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
+	// 检查是否是领导者
 	if rf.state != "leader" {
+		rf.mu.Unlock()
 		return
 	}
 
+	// 获取所需信息并解锁
+	peers := rf.peers
+	me := rf.me
+	fmt.Printf("领导者 %d: 开始向所有服务器发送日志\n", me)
+	rf.mu.Unlock()
+
 	// 触发向所有服务器发送日志
-	for i := range rf.peers {
-		if i != rf.me {
+	for i := range peers {
+		if i != me {
 			go rf.sendLogEntries(i)
 		}
 	}
@@ -284,13 +312,23 @@ func (rf *Raft) sendLogEntries(server int) {
 		return
 	}
 
+	// 安全检查：防止数组索引越界
+	if rf.nextIndex[server] > len(rf.logs) {
+		rf.nextIndex[server] = len(rf.logs)
+	}
+
 	prevLogIndex := rf.nextIndex[server] - 1
-	prevLogTerm := rf.logs[prevLogIndex].Term
-	//如果档案记录的节点下一个日志小于目前主节点拥有的日志，那么应该发送后面一段该节点没有的
+	prevLogTerm := 0
+	if prevLogIndex >= 0 && prevLogIndex < len(rf.logs) {
+		prevLogTerm = rf.logs[prevLogIndex].Term
+	}
+
+	// 构建要发送的日志条目
 	entries := make([]LogEntry, 0)
 	if rf.nextIndex[server] < len(rf.logs) {
 		entries = append(entries, rf.logs[rf.nextIndex[server]:]...)
 	}
+
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -298,37 +336,124 @@ func (rf *Raft) sendLogEntries(server int) {
 		PrevLogIndex: prevLogIndex,
 		LeaderCommit: rf.commitIndex,
 		PrevLogTerm:  prevLogTerm}
-	// 记录当前的任期，用于后续检查
+
+	// 记录发送时的状态，用于后续检查
 	currentTerm := rf.currentTerm
+	sentNextIndex := rf.nextIndex[server]
+	sentPrevLogIndex := prevLogIndex
+	entriesLen := len(entries)
+
+	fmt.Printf("领导者 %d: 发送日志条目给服务器 %d, prevLogIndex=%d, prevLogTerm=%d, 条目数=%d, 提交索引=%d, 当前任期=%d\n",
+		rf.me, server, prevLogIndex, prevLogTerm, len(entries), rf.commitIndex, rf.currentTerm)
+
 	rf.mu.Unlock()
+
 	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, &args, &reply)
+
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		//每次操作都要对leader状态进行确认
-		if reply.Term > currentTerm {
+
+		// 如果当前不再是leader或任期已经变化，直接返回
+		if rf.state != "leader" || rf.currentTerm != currentTerm {
+			fmt.Printf("领导者 %d: 不再是领导者或任期已变，忽略来自服务器 %d 的响应\n", rf.me, server)
+			return
+		}
+
+		// 处理更高任期
+		if reply.Term > rf.currentTerm {
+			fmt.Printf("领导者 %d: 发现更高任期 %d > %d, 转为跟随者\n", rf.me, reply.Term, rf.currentTerm)
 			rf.currentTerm = reply.Term
 			rf.state = "follower"
 			rf.votedFor = -1
 			rf.persist()
 			return
 		}
-		//如果写入成功，就更新nextIndex和matchIndex，不成功就降低nextIndex然后异步重试
+
+		// 处理日志复制结果
 		if reply.Success {
-			rf.nextIndex[server] = rf.matchIndex[server] + 1
-			rf.matchIndex[server] = prevLogIndex + len(entries)
-			//这里需要检查是否有新的日志可以提交
+			// 成功复制日志，更新nextIndex和matchIndex
+			// 注意：只有当实际发送了日志条目时才更新matchIndex
+			newMatchIndex := sentPrevLogIndex + entriesLen
+			newNextIndex := newMatchIndex + 1
+
+			fmt.Printf("领导者 %d: 服务器 %d 成功接收日志，更新matchIndex=%d, nextIndex=%d\n",
+				rf.me, server, newMatchIndex, newNextIndex)
+
+			// 更新matchIndex和nextIndex
+			rf.matchIndex[server] = max(rf.matchIndex[server], newMatchIndex)
+			rf.nextIndex[server] = max(rf.nextIndex[server], newNextIndex)
+
+			// 尝试更新commitIndex
 			rf.updateCommitIndex()
 		} else {
-			if rf.nextIndex[server] > 1 {
-				rf.nextIndex[server]--
+			// 日志一致性检查失败，利用冲突信息优化nextIndex回退
+			if rf.nextIndex[server] == sentNextIndex { // 确保没有被其他RPC更新
+				oldNextIndex := rf.nextIndex[server]
+
+				if reply.ConflictIndex >= 0 {
+					if reply.ConflictTerm == -1 {
+						// 日志长度不够
+						fmt.Printf("领导者 %d: 服务器 %d 日志太短，将nextIndex设置为 %d\n",
+							rf.me, server, reply.ConflictIndex)
+						rf.nextIndex[server] = reply.ConflictIndex
+					} else {
+						// 任期冲突，找到该冲突任期的最后一个日志
+						conflictTermLastIndex := -1
+
+						// 尝试找到相同任期的最后一条日志
+						for i := sentPrevLogIndex; i >= 0; i-- {
+							if i < len(rf.logs) && rf.logs[i].Term == reply.ConflictTerm {
+								conflictTermLastIndex = i + 1
+								break
+							}
+							if i < len(rf.logs) && rf.logs[i].Term < reply.ConflictTerm {
+								// 找不到该任期，直接跳到follower的冲突索引
+								break
+							}
+						}
+
+						if conflictTermLastIndex != -1 {
+							rf.nextIndex[server] = conflictTermLastIndex
+						} else {
+							rf.nextIndex[server] = reply.ConflictIndex
+						}
+
+						fmt.Printf("领导者 %d: 服务器 %d 任期冲突，将nextIndex从 %d 减少到 %d\n",
+							rf.me, server, oldNextIndex, rf.nextIndex[server])
+					}
+				} else {
+					// 兼容缺少冲突信息的旧版本回复
+					newNextIndex := max(1, sentPrevLogIndex/2)
+					fmt.Printf("领导者 %d: 服务器 %d 一致性检查失败，减少nextIndex %d -> %d\n",
+						rf.me, server, oldNextIndex, newNextIndex)
+					rf.nextIndex[server] = newNextIndex
+				}
 			}
-			// 重试
+
+			// 立即重试，使用新的nextIndex
 			go rf.sendLogEntries(server)
 		}
-
+	} else {
+		fmt.Printf("领导者 %d: 发送日志给服务器 %d 失败，RPC调用失败\n", rf.me, server)
 	}
+}
+
+// 返回两个整数中的最大值
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// 返回两个整数中的最小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // 测试器不会在每次测试后停止由 Raft 创建的 goroutine，
@@ -414,6 +539,10 @@ func (rf *Raft) startElection() {
 
 	// 持久化状态
 	rf.persist()
+
+	fmt.Printf("服务器 %d: 开始选举，任期=%d，日志长度=%d，最后日志任期=%d\n",
+		rf.me, currentTerm, lastLogIndex+1, lastLogTerm)
+
 	rf.mu.Unlock()
 
 	// 向所有其他服务器发送RequestVote RPC
@@ -458,19 +587,27 @@ func (rf *Raft) startElection() {
 					if rf.votesReceived >= majority && rf.state == "candidate" {
 						// 成为领导者
 						rf.state = "leader"
+						fmt.Printf("服务器 %d: 成为领导者，任期=%d，最后日志索引=%d\n",
+							rf.me, rf.currentTerm, len(rf.logs)-1)
 
 						// 初始化领导者状态
 						rf.nextIndex = make([]int, len(rf.peers))
 						rf.matchIndex = make([]int, len(rf.peers))
 						for i := range rf.peers {
+							// nextIndex初始化为领导者日志的最后索引+1
 							rf.nextIndex[i] = len(rf.logs)
+							// matchIndex初始化为0，表示还未确认复制的日志
 							rf.matchIndex[i] = 0
 						}
 
+						// 自己的matchIndex应该是最新的日志索引（最后一个已知的索引）
+						rf.matchIndex[rf.me] = len(rf.logs) - 1
+
 						// 立即发送心跳以建立权威
 						go rf.startHeartbeats()
+						// 立即尝试复制日志
+						go rf.startAppendEntries()
 					}
-
 				}
 			}
 		}(i, currentTerm)
@@ -561,6 +698,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool //如果跟随者包含有匹配的prevLogIndex和prevLogTerm，则返回true，这个就不是心跳
+
+	// 为了优化冲突解决过程而添加的字段
+	ConflictIndex int // 冲突的索引位置
+	ConflictTerm  int // 冲突位置的任期
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -570,107 +711,218 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 初始化回复
 	reply.Success = false
 	reply.Term = rf.currentTerm
+	reply.ConflictIndex = -1
+	reply.ConflictTerm = -1
 
-	// 如果RPC的任期小于当前任期，拒绝
+	// 记录服务器ID和当前状态，便于调试
+	serverId := rf.me
+
+	// 打印当前日志状态以便调试
+	fmt.Printf("服务器 %d: 当前日志状态: 长度=%d, commitIndex=%d, 最后任期=%d, 当前任期=%d\n",
+		serverId, len(rf.logs), rf.commitIndex, rf.logs[len(rf.logs)-1].Term, rf.currentTerm)
+	fmt.Printf("服务器 %d: 收到AppendEntries: prevLogIndex=%d, prevLogTerm=%d, 条目数=%d, leaderCommit=%d, 领导者任期=%d\n",
+		serverId, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderCommit, args.Term)
+
+	// 规则1: 如果RPC的任期小于当前任期，拒绝
 	if args.Term < rf.currentTerm {
+		fmt.Printf("服务器 %d: 拒绝来自 %d 的AppendEntries(更低任期 %d < %d)\n",
+			serverId, args.LeaderId, args.Term, rf.currentTerm)
 		return
 	}
 
-	// 收到与当前或更高任期的AppendEntries，认可领导者权威
-	// 重置选举超时计时器
+	// 重置选举超时计时器，无论是否接受日志
 	rf.lastHeartbeat = time.Now()
 
-	// 如果收到更高任期，转为follower
+	// 如果收到更高任期，转为follower并更新任期
 	if args.Term > rf.currentTerm {
+		fmt.Printf("服务器 %d: 收到更高任期 %d > %d 的AppendEntries, 转为跟随者\n",
+			serverId, args.Term, rf.currentTerm)
+
 		rf.currentTerm = args.Term
 		rf.state = "follower"
 		rf.votedFor = -1
 		rf.persist()
 	} else if rf.state == "candidate" && args.Term == rf.currentTerm {
 		// 同任期收到AppendEntries，认可对方为领导者
+		fmt.Printf("服务器 %d: 候选人收到同任期的AppendEntries, 转为跟随者\n", serverId)
 		rf.state = "follower"
 	}
 
-	// 更新Term
+	// 更新回复中的任期
 	reply.Term = rf.currentTerm
 
-	// 处理心跳请求 (空Entries)
-	if len(args.Entries) == 0 {
-		reply.Success = true
-		return
-	}
-	//日志一致性检查，保证跟随者最后一个日志至少大于preIndex并且任期得一样
+	// 规则2: 如果日志不包含prevLogIndex位置任期为prevLogTerm的条目，则拒绝
+	// 但提供有用的冲突信息，以帮助leader更快找到匹配点
+
+	// 如果prevLogIndex超出了日志长度
 	if args.PrevLogIndex >= len(rf.logs) {
-		// 跟随者日志比prevLogIndex短，失败
-		reply.Success = false
+		fmt.Printf("服务器 %d: 日志太短 (长度=%d, 需要的索引=%d)\n", serverId, len(rf.logs), args.PrevLogIndex)
+
+		// 提供冲突信息以加速回退过程
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1 // 表示日志长度不够
 		return
 	}
+
+	// 如果prevLogIndex处的日志任期不匹配
 	if args.PrevLogIndex >= 0 && rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// prevLogIndex位置的任期不匹配，失败
-		reply.Success = false
+		// 记录冲突信息以优化回退
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+
+		// 找到该任期的第一个日志索引
+		reply.ConflictIndex = 1 // 默认至少回退到索引1
+		for i := args.PrevLogIndex; i >= 1; i-- {
+			if rf.logs[i].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i + 1
+				break
+			}
+		}
+
+		fmt.Printf("服务器 %d: prevLogIndex=%d处的任期不匹配(本地=%d, 领导者=%d)，冲突索引=%d\n",
+			serverId, args.PrevLogIndex, rf.logs[args.PrevLogIndex].Term, args.PrevLogTerm, reply.ConflictIndex)
 		return
 	}
+
+	// 一致性检查通过，处理日志条目
 	reply.Success = true
-	//追加日志，注意用截取的方式
-	if len(args.Entries) > 0 {
-		rf.logs = rf.logs[:args.PrevLogIndex+1]
-		rf.logs = append(rf.logs, args.Entries...)
+
+	// 如果是空的AppendEntries (心跳)
+	if len(args.Entries) == 0 {
+		// 检查是否需要更新commitIndex
+		if args.LeaderCommit > rf.commitIndex {
+			oldCommitIndex := rf.commitIndex
+			// 更新commitIndex为领导者的commitIndex和我们自己日志长度中的较小值
+			rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+			fmt.Printf("服务器 %d: (心跳)更新提交索引 %d -> %d\n", serverId, oldCommitIndex, rf.commitIndex)
+		}
+		return
+	}
+
+	// 正常的AppendEntries处理逻辑（非心跳）
+	// 从 prevLogIndex 之后的位置开始追加新日志
+
+	// 查找冲突点 (从prevLogIndex+1开始)
+	nextIndex := args.PrevLogIndex + 1
+	newEntryIndex := 0
+
+	// 在重叠的范围内查找任期不同的条目
+	for newEntryIndex < len(args.Entries) && nextIndex < len(rf.logs) {
+		if rf.logs[nextIndex].Term != args.Entries[newEntryIndex].Term {
+			// 找到冲突点，需要截断从这里开始的所有日志
+			fmt.Printf("服务器 %d: 在索引 %d 处发现冲突，截断后续日志\n",
+				serverId, nextIndex)
+			rf.logs = rf.logs[:nextIndex]
+			break
+		}
+		nextIndex++
+		newEntryIndex++
+	}
+
+	// 追加所有尚未添加的新日志
+	if newEntryIndex < len(args.Entries) {
+		fmt.Printf("服务器 %d: 追加 %d 条新日志，从索引 %d 开始\n",
+			serverId, len(args.Entries)-newEntryIndex, len(rf.logs))
+		rf.logs = append(rf.logs, args.Entries[newEntryIndex:]...)
 		rf.persist()
 	}
+
 	// 更新commitIndex
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1) //怎么理解
-		// 应用新提交的日志到状态机
-		go rf.applyLogs()
+		oldCommitIndex := rf.commitIndex
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		rf.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
+		fmt.Printf("服务器 %d: 更新提交索引 %d -> %d\n", serverId, oldCommitIndex, rf.commitIndex)
 	}
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	fmt.Printf("服务器 %d: 实际发送AppendEntries RPC给服务器 %d\n", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	fmt.Printf("服务器 %d: 发送给服务器 %d 的AppendEntries RPC返回 %v\n", rf.me, server, ok)
 	return ok
 }
 
 func (rf *Raft) applyLogs() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock() // 应用所有已提交但未应用的日志
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		applyMsg := raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      rf.logs[i].Command,
-			CommandIndex: i,
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		// 检查是否有日志需要应用
+		if rf.lastApplied >= rf.commitIndex {
+			rf.mu.Unlock()
+			// 如果没有需要应用的日志，短暂休眠再检查
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 
-		// 解锁再发送，避免死锁
+		// 有日志需要应用，逐个应用
+		toApply := make([]raftapi.ApplyMsg, 0)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex && i < len(rf.logs); i++ {
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[i].Command,
+				CommandIndex: i,
+			}
+			toApply = append(toApply, msg)
+			rf.lastApplied = i
+		}
+
 		rf.mu.Unlock()
-		rf.applyCh <- applyMsg
-		rf.mu.Lock()
-		rf.lastApplied = i
+
+		// 在没有持有锁的情况下发送消息
+		for _, msg := range toApply {
+			fmt.Printf("服务器 %d: 应用索引 %d 的命令 %v\n", rf.me, msg.CommandIndex, msg.Command)
+			rf.applyCh <- msg
+		}
+
+		// 短暂休眠，避免CPU过度使用
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func (rf *Raft) updateCommitIndex() {
-	// 领导者查找可以提交的最高日志索引，保证大多数都有这个日志才能提交。
-	// 注意：只考虑当前任期的日志条目
-	for i := rf.commitIndex + 1; i < len(rf.logs); i++ {
-		if rf.logs[i].Term == rf.currentTerm {
-			// 计算已复制到大多数服务器的日志
-			count := 1 // 领导者自己
-			for peer := range rf.peers {
-				if peer != rf.me && rf.matchIndex[peer] >= i {
-					count++
-				}
-			}
-			// 如果大多数服务器已复制，则提交
-			if count > len(rf.peers)/2 {
-				rf.commitIndex = i
-			} else {
-				// 如果这个索引未达到多数，后面的也不会达到
-				break
+	// 只有领导者才能更新commitIndex (基于matchIndex)
+	if rf.state != "leader" {
+		return
+	}
+
+	// 记录旧的commitIndex，用于检测变化
+	oldCommitIndex := rf.commitIndex
+
+	// 计算多数派数量
+	majority := len(rf.peers)/2 + 1
+
+	// 严格按照Raft论文5.4.2节实现：
+	// 只有当日志被复制到大多数服务器时才能提交
+	// 且领导者只提交当前任期的日志
+
+	// 从旧的commitIndex+1开始，检查每个索引是否可以提交
+	for N := rf.commitIndex + 1; N < len(rf.logs); N++ {
+		// 计算复制到多少服务器了
+		replicationCount := 1 // 包括领导者自己
+		for server := range rf.peers {
+			if server != rf.me && rf.matchIndex[server] >= N {
+				replicationCount++
 			}
 		}
+
+		// 如果超过多数派复制了该日志
+		if replicationCount >= majority {
+			// 关键安全属性：只提交当前任期的日志条目
+			// 这是Raft的核心安全规则，防止已经被提交的日志被覆盖
+			if rf.logs[N].Term == rf.currentTerm {
+				rf.commitIndex = N
+				fmt.Printf("领导者 %d: 日志索引 %d 已复制到 %d 个节点，属于当前任期 %d，提交该日志\n",
+					rf.me, N, replicationCount, rf.currentTerm)
+			}
+		} else {
+			// 如果该索引未达到多数复制，后续更高索引肯定也未达到，可以停止循环
+			break
+		}
 	}
-	// 应用新提交的日志
-	if rf.lastApplied < rf.commitIndex {
-		go rf.applyLogs()
+
+	// 如果commitIndex有更新，通知跟随者
+	if rf.commitIndex > oldCommitIndex {
+		fmt.Printf("领导者 %d: 更新commitIndex: %d -> %d\n", rf.me, oldCommitIndex, rf.commitIndex)
+		go rf.startAppendEntries()
 	}
 }
 
@@ -690,11 +942,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.state = "follower"
 	rf.lastHeartbeat = time.Now() // 初始化心跳时间为当前时间
-	rf.logs = make([]LogEntry, 1) // 创建带有哨兵值的日志数组
-	rf.logs[0] = LogEntry{nil, 0} // 索引0的哨兵日志
+
+	// 创建日志数组，索引0处放置一个哨兵日志条目
+	rf.logs = make([]LogEntry, 1)
+	rf.logs[0] = LogEntry{Command: nil, Term: 0}
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
+
 	// 这些变量只有在成为领导者时才会初始化
 	rf.nextIndex = nil
 	rf.matchIndex = nil
@@ -704,6 +960,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// 启动goroutine处理选举和心跳
 	go rf.ticker()
+
+	// 启动goroutine应用日志
+	go rf.applyLogs()
 
 	return rf
 }
